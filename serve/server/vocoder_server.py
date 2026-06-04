@@ -151,25 +151,32 @@ class CosyVoiceVocoderServer:
 
 
 def create_app(server: CosyVoiceVocoderServer):
+    import asyncio
     from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
 
     app = FastAPI(title='CosyVoice Vocoder Server')
     app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
 
+    infer_lock = asyncio.Lock()
+
     @app.post('/v1/generate')
     async def generate(request: dict):
-        return server.generate(
-            mel=request['mel'],
-            finalize=request.get('finalize', True),
-        )
+        async with infer_lock:
+            return await asyncio.to_thread(
+                server.generate,
+                mel=request['mel'],
+                finalize=request.get('finalize', True),
+            )
 
     @app.post('/v1/generate_batch')
     async def generate_batch(request: dict):
-        return server.generate_batch(
-            items=request['items'],
-            finalize=request.get('finalize', True),
-        )
+        async with infer_lock:
+            return await asyncio.to_thread(
+                server.generate_batch,
+                items=request['items'],
+                finalize=request.get('finalize', True),
+            )
 
     @app.get('/health')
     async def health():

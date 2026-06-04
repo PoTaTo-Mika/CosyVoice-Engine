@@ -8,6 +8,7 @@ scipy==1.17.1
 transformers==4.57.1
 # tensorrt-llm  -- installed via pip, not on PyPI; see README for install instructions
 # mpi4py         -- installed via conda: conda install -c conda-forge mpi4py
+# flash_attn    自己手动装轮子
 
 # Flow Matching / Vocoder (hyperpyyaml)
 HyperPyYAML==1.2.3

@@ -24,6 +24,8 @@ checkpoints/
 
 ## 2. 构建 TRT Engine
 
+**土豆注**：因为TRT是严格要求 GPU 型号，TRT版本，torch版本，CUDA版本全都匹配的，所以每换一种新卡
+
 三步 pipeline，将 CosyVoice3 LLM 转换为 TensorRT engine：
 
 | 步骤 | 输入 | 输出 | 说明 |

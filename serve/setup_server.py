@@ -33,6 +33,8 @@ for p in [_REPO_ROOT, _COSYVOICE_DIR, _MATCHA_DIR]:
 
 
 def start_llm(args):
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.llm_gpu)
+
     from serve.server.llm_server import CosyVoiceLLMServer, create_app
 
     server = CosyVoiceLLMServer(
@@ -54,6 +56,8 @@ def start_llm(args):
 
 
 def start_fm(args):
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.fm_vocoder_gpu)
+
     from serve.server.fm_server import CosyVoiceFMServer, create_app
 
     server = CosyVoiceFMServer(
@@ -69,6 +73,8 @@ def start_fm(args):
 
 
 def start_vocoder(args):
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.vocoder_gpu)
+
     from serve.server.vocoder_server import CosyVoiceVocoderServer, create_app
 
     server = CosyVoiceVocoderServer(
@@ -124,6 +130,14 @@ def main():
     parser.add_argument('--service', type=str, choices=['llm', 'fm', 'vocoder', 'all'],
                         default='all', help='Which service to start (default: all)')
     parser.add_argument('--host', type=str, default='0.0.0.0')
+
+    # GPU assignment
+    parser.add_argument('--llm-gpu', type=int, default=0,
+                        help='GPU device ID for LLM service')
+    parser.add_argument('--fm-vocoder-gpu', type=int, default=1,
+                        help='GPU device ID for FM service')
+    parser.add_argument('--vocoder-gpu', type=int, default=2,
+                        help='GPU device ID for Vocoder service')
 
     # Model paths
     parser.add_argument('--model-dir', type=str, default=CHECKPOINTS_DIR,

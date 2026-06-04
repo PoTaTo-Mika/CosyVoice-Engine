@@ -256,14 +256,13 @@ class FlowMatchingEngine:
             )
 
         # Un-batch: trim each mel to its actual length
+        # flow.py already trimmed the prompt part (feat[:, :, mel_len1:]),
+        # so mel here only contains the generated portion.
         mel = mel.float()
         results = []
         for i in range(len(items)):
-            # mel_len2 for each item = total_mel_len - prompt_feat_len
-            pf_len = prompt_feat_len_list[i]
-            # The model output mel shape is (B, 80, T_mel), where T_mel = mel_len1 + mel_len2
-            # Each item's actual mel_len2 depends on its own token_len
-            item_mel = mel[i:i+1, :, pf_len:]
+            actual_mel_len = token_len_list[i] * self.token_mel_ratio
+            item_mel = mel[i:i+1, :, :actual_mel_len]
             results.append((item_mel, None))
 
         return results
