@@ -68,11 +68,6 @@ class FlowMatchingEngine:
 
         # Extract flow model
         self.model = configs['flow']
-        if not isinstance(self.model, CausalMaskedDiffWithDiT):
-            raise TypeError(
-                f'Expected CausalMaskedDiffWithDiT, got {type(self.model).__name__}. '
-                f'This engine only supports CosyVoice3.'
-            )
 
         self.sample_rate = configs.get('sample_rate', 24000)
         self.token_mel_ratio = self.model.token_mel_ratio

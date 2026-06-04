@@ -15,13 +15,14 @@ from typing import Optional
 
 import torch
 
+from serve.paths import CHECKPOINTS_DIR
 from serve.server.inference.fm_infer import FlowMatchingEngine
 
 
 class CosyVoiceFMServer:
     """Flow matching server wrapping FlowMatchingEngine."""
 
-    def __init__(self, model_dir: str, fp16: bool = False,
+    def __init__(self, model_dir: str = CHECKPOINTS_DIR, fp16: bool = False,
                  device: Optional[str] = None, n_timesteps: int = 10,
                  inference_cfg_rate: Optional[float] = None):
         self.engine = FlowMatchingEngine(

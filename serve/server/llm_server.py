@@ -1,36 +1,33 @@
 """
-TensorRT-LLM based LLM Server for CosyVoice.
+TensorRT-LLM based LLM Server for CosyVoice3.
 
-Provides an OpenAI-compatible API for batched LLM inference (text tokens -> semantic speech tokens).
+Provides an HTTP API for batched LLM inference (text -> semantic speech tokens).
 Uses TensorRT-LLM's ModelRunnerCpp for inflight fused batching.
 
-Usage:
-    # Step 1: Build TRT engine (one-time, see serve/build_engine.py)
-    python serve/build_engine.py \
-        --model-dir ./pretrained_models/CosyVoice2-0.5B \
-        --engine-dir ./trt_engines \
-        --dtype bfloat16
+Requires a pre-built TRT engine from serve/build_engine.py, which produces
+a merged HuggingFace model with speech tokens added to the vocabulary.
 
-    # Step 2: Launch server
-    python -m serve.server.llm_server \
-        --engine-dir ./trt_engines \
-        --tokenizer-dir ./pretrained_models/cosyvoice2_llm \
-        --max-batch-size 16 \
+Usage:
+    python serve/setup_server.py \
         --port 50000
 """
 
+import json
+import os
 import time
 from typing import List, Optional
 
 import torch
 
+from serve.paths import CHECKPOINTS_DIR
+
 
 class CosyVoiceLLMServer:
     """TensorRT-LLM backed LLM server with inflight fused batching.
 
-    Loads the pre-built TRT engine and exposes an inference API.
-    Multiple concurrent requests are automatically batched by TRT-LLM's
-    inflight batching scheduler.
+    Loads the pre-built TRT engine and the merged HF tokenizer.
+    Speech token IDs in the merged vocab are offset by speech_token_offset
+    (stored in cosyvoice3_metadata.json).
     """
 
     def __init__(self, engine_dir: str, tokenizer_dir: str,
@@ -54,20 +51,29 @@ class CosyVoiceLLMServer:
         self.top_p = top_p
         self.repetition_penalty = repetition_penalty
 
-        # Load tokenizer
+        # Load tokenizer from merged HF model
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
-        self.prompt_template = '<|sos|>{input_text}<|task_id|>'
 
-        # Determine EOS token id
-        eos_candidates = ['<|eos1|>', '<|eos|>']
-        self.eos_token_id = None
-        for tok_name in eos_candidates:
-            if tok_name in self.tokenizer.get_vocab():
-                self.eos_token_id = self.tokenizer.convert_tokens_to_ids(tok_name)
-                break
+        # Load metadata for speech token offset
+        metadata_path = os.path.join(tokenizer_dir, 'cosyvoice3_metadata.json')
+        if os.path.exists(metadata_path):
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            self.speech_token_offset = metadata['speech_token_offset']
+            self.base_speech_token_size = metadata['base_speech_token_size']
+        else:
+            # Fallback: compute from tokenizer vocab
+            self.speech_token_offset = self._infer_speech_offset()
+            self.base_speech_token_size = 6561
+
+        # EOS: speech eos = offset + base_speech_token_size + 1
+        self.eos_token_id = self.tokenizer.convert_tokens_to_ids('<|eos1|>')
         if self.eos_token_id is None:
-            self.eos_token_id = self.tokenizer.eos_token_id
-        print(f'EOS token id: {self.eos_token_id}')
+            self.eos_token_id = self.speech_token_offset + self.base_speech_token_size + 1
+
+        print(f'speech_token_offset={self.speech_token_offset}, '
+              f'eos_token_id={self.eos_token_id}, '
+              f'tokenizer vocab size={len(self.tokenizer)}')
 
         # Load TRT engine
         runtime_rank = tensorrt_llm.mpi_rank()
@@ -84,14 +90,47 @@ class CosyVoiceLLMServer:
         )
         print(f'TRT-LLM engine loaded from {engine_dir}, max_batch_size={max_batch_size}')
 
+    def _infer_speech_offset(self) -> int:
+        """Fallback: find <|s_0|> in tokenizer to determine offset."""
+        tid = self.tokenizer.convert_tokens_to_ids('<|s_0|>')
+        if tid is not None:
+            return tid
+        raise ValueError('Cannot determine speech_token_offset from tokenizer. '
+                         'Ensure cosyvoice3_metadata.json exists in tokenizer_dir.')
+
+    def prepare_input(self, text: str, prompt_speech_tokens: Optional[List[int]] = None) -> torch.Tensor:
+        """Prepare input_ids from text and optional prompt speech tokens.
+
+        For zero-shot/few-shot voice cloning:
+          - text should be: "You are a helpful assistant.<|endofprompt|>{transcription}{tts_text}"
+          - prompt_speech_tokens should be the full speech tokens from the reference audio
+
+        For instruct mode (no voice cloning):
+          - text should be: "You are a helpful assistant.<|endofprompt|>{tts_text}"
+          - prompt_speech_tokens should be None
+
+        Speech tokens are raw IDs (0-6560) that get offset to merged vocab IDs.
+        """
+        # Format: <|sos|>{text}<|task_id|>{prompt_speech_tokens}
+        # Use chat template for consistent tokenization
+        chat = [{"role": "user", "content": text}]
+        if prompt_speech_tokens:
+            # Convert raw speech IDs to merged vocab IDs
+            prompt_str = ''.join(f'<|s_{t}|>' for t in prompt_speech_tokens)
+            chat.append({"role": "assistant", "content": prompt_str})
+            input_ids = self.tokenizer.apply_chat_template(
+                chat, tokenize=True, return_tensors='pt',
+                continue_final_message=True)
+        else:
+            input_ids = self.tokenizer.apply_chat_template(
+                chat, tokenize=True, return_tensors='pt')
+
+        return input_ids.squeeze(0).to(torch.int32)
+
     def generate(self, input_ids_list: List[torch.Tensor]) -> List[List[int]]:
         """Run batched LLM generation.
 
-        Args:
-            input_ids_list: List of 1-D int32 tensors, each is a token sequence.
-
-        Returns:
-            List of generated semantic token id lists (input tokens excluded).
+        Returns raw speech token IDs (0-6560), with EOS/special tokens removed.
         """
         input_lengths = [x.size(0) for x in input_ids_list]
 
@@ -113,30 +152,25 @@ class CosyVoiceLLMServer:
         torch.cuda.synchronize()
 
         output_ids = outputs['output_ids']
-        sequence_lengths = outputs['sequence_length']
+        sequence_lengths = outputs['sequence_lengths']
 
         results = []
         for i in range(len(input_ids_list)):
             output_begin = input_lengths[i]
             output_end = sequence_lengths[i][0]
             generated = output_ids[i][0][output_begin:output_end].tolist()
-            results.append(generated)
+
+            # Convert merged vocab IDs back to raw speech token IDs
+            speech_ids = []
+            for tid in generated:
+                if tid >= self.speech_token_offset:
+                    raw_id = tid - self.speech_token_offset
+                    if raw_id < self.base_speech_token_size:
+                        speech_ids.append(raw_id)
+                    # else: special token (sos/eos/task_id/fill), skip
+            results.append(speech_ids)
 
         return results
-
-    def prepare_input(self, text: str, prompt_speech_tokens: Optional[List[int]] = None) -> torch.Tensor:
-        """Prepare input_ids from text and optional prompt speech tokens.
-
-        The format follows CosyVoice2's convention:
-            <|sos|>{prompt_text}{text}<|task_id|>{speech_token_ids}
-        """
-        prompt = self.prompt_template.format(input_text=text)
-        input_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
-
-        if prompt_speech_tokens is not None:
-            input_ids = input_ids + list(prompt_speech_tokens)
-
-        return torch.tensor(input_ids, dtype=torch.int32)
 
 
 def create_app(server: CosyVoiceLLMServer):
@@ -158,9 +192,6 @@ def create_app(server: CosyVoiceLLMServer):
         latency = (time.time() - start) * 1000
 
         speech_tokens = results[0]
-        if server.eos_token_id in speech_tokens:
-            speech_tokens = speech_tokens[:speech_tokens.index(server.eos_token_id)]
-
         return {
             'speech_tokens': speech_tokens,
             'latency_ms': latency,
@@ -169,14 +200,6 @@ def create_app(server: CosyVoiceLLMServer):
     @app.post('/v1/generate_batch')
     async def generate_batch(request: dict):
         items = request['items']
-        temperature = request.get('temperature', server.temperature)
-        top_k = request.get('top_k', server.top_k)
-        top_p = request.get('top_p', server.top_p)
-
-        orig_temp, orig_topk, orig_topp = server.temperature, server.top_k, server.top_p
-        server.temperature = temperature
-        server.top_k = top_k
-        server.top_p = top_p
 
         input_ids_list = []
         for item in items:
@@ -187,13 +210,7 @@ def create_app(server: CosyVoiceLLMServer):
         results = server.generate(input_ids_list)
         total_latency = (time.time() - start) * 1000
 
-        server.temperature, server.top_k, server.top_p = orig_temp, orig_topk, orig_topp
-
-        response_results = []
-        for tokens in results:
-            if server.eos_token_id in tokens:
-                tokens = tokens[:tokens.index(server.eos_token_id)]
-            response_results.append({'speech_tokens': tokens})
+        response_results = [{'speech_tokens': tokens} for tokens in results]
 
         return {
             'results': response_results,
@@ -203,8 +220,10 @@ def create_app(server: CosyVoiceLLMServer):
 
     @app.get('/health')
     async def health():
-        return {'status': 'ok', 'max_batch_size': server.max_batch_size}
+        return {
+            'status': 'ok',
+            'max_batch_size': server.max_batch_size,
+            'speech_token_offset': server.speech_token_offset,
+        }
 
     return app
-
-

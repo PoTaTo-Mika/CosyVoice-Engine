@@ -18,11 +18,13 @@ import torch
 
 from hyperpyyaml import load_hyperpyyaml
 
+from serve.paths import CHECKPOINTS_DIR
+
 
 class CosyVoiceVocoderServer:
     """Vocoder server wrapping CausalHiFTGenerator."""
 
-    def __init__(self, model_dir: str, fp16: bool = False,
+    def __init__(self, model_dir: str = CHECKPOINTS_DIR, fp16: bool = False,
                  device: Optional[str] = None):
         self.model_dir = model_dir
         self.fp16 = fp16
@@ -184,7 +186,7 @@ if __name__ == '__main__':
     import uvicorn
 
     parser = argparse.ArgumentParser(description='CosyVoice Vocoder Server')
-    parser.add_argument('--model-dir', type=str, required=True,
+    parser.add_argument('--model-dir', type=str, default=CHECKPOINTS_DIR,
                         help='Path to pretrained model directory containing cosyvoice3.yaml and hift.pt')
     parser.add_argument('--host', type=str, default='0.0.0.0')
     parser.add_argument('--port', type=int, default=50002)

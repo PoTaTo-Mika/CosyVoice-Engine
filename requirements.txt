@@ -1,0 +1,40 @@
+# Core
+torch==2.8.0
+torchaudio==2.8.0
+numpy==2.4.6
+scipy==1.17.1
+
+# LLM (TRT-LLM)
+transformers==4.57.1
+# tensorrt-llm  -- installed via pip, not on PyPI; see README for install instructions
+# mpi4py         -- installed via conda: conda install -c conda-forge mpi4py
+
+# Flow Matching / Vocoder (hyperpyyaml)
+HyperPyYAML==1.2.3
+safetensors==0.7.0
+
+# ONNX models (campplus, speech_tokenizer)
+onnxruntime==1.26.0
+
+# Audio I/O
+soundfile==0.13.1
+openai-whisper==20250625
+
+# Server
+fastapi==0.136.1
+uvicorn==0.47.0
+pydantic==2.9.2
+
+# Text processing (CosyVoice frontend)
+pypinyin==0.55.0
+jieba==0.42.1
+opencc-python-reimplemented==0.1.7
+inflect==7.5.0
+Unidecode==1.4.0
+
+# Misc
+regex==2026.5.9
+einops==0.8.2
+librosa==0.11.0
+gdown==6.1.0
+wget==3.2
