@@ -24,7 +24,7 @@ checkpoints/
 
 ## 2. 构建 TRT Engine
 
-**土豆注**：因为TRT是严格要求 GPU 型号，TRT版本，torch版本，CUDA版本全都匹配的，所以每换一种新卡
+**土豆注**：因为TRT是严格要求 GPU 型号，TRT版本，torch版本，CUDA版本全都匹配的，所以每换一种新卡就要重新构建一下。
 
 三步 pipeline，将 CosyVoice3 LLM 转换为 TensorRT engine：
 
@@ -106,3 +106,5 @@ PYTHONPATH=. python -m serve.server.vocoder_server --port 50002
 ```
 
 所有服务默认从 `./checkpoints/` 加载权重，无需手动指定路径。可通过 `COSYVOICE_CHECKPOINTS_DIR` 环境变量覆盖。
+
+要是效果不好的话就回滚到 cadd46258d2ebfb3612077503ce07dbfd791d50b 这个commit，因为batch的flow inference对显存开销巨大，可能还不如串行或者低batch的效果。

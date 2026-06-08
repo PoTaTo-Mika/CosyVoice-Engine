@@ -1,22 +1,21 @@
 """
 CosyVoice Service Launcher.
 
-Starts inference services and their dynamic batchers:
-  - llm:          TensorRT-LLM based LLM server (text -> speech tokens)
-  - fm:           Flow Matching server (speech tokens -> mel spectrogram)
-  - vocoder:      Vocoder server (mel spectrogram -> waveform)
-  - llm-batcher:  Dynamic batcher in front of LLM
-  - fm-batcher:   Dynamic batcher in front of FM
-  - vocoder-batcher: Dynamic batcher in front of Vocoder
+Starts the full inference stack in three phases:
+  Phase 1 — Backend services (LLM, FM, Vocoder)
+  Phase 2 — Dynamic batchers (one per backend, for request aggregation)
+  Phase 3 — Gateway (single-entry point: text → WAV)
 
 Usage:
-    # Start all services (backends + batchers):
+    # Start everything:
     python serve/setup_server.py
 
-    # Start a specific service:
+    # Start a specific component:
     python serve/setup_server.py --service llm
     python serve/setup_server.py --service fm
     python serve/setup_server.py --service vocoder
+    python serve/setup_server.py --service gateway
+    python serve/setup_server.py --service batcher
 """
 
 import argparse
@@ -42,6 +41,7 @@ VOCODER_BACKEND_PORT = 50002
 LLM_BATCHER_PORT = 50100
 FM_BATCHER_PORT = 50101
 VOCODER_BATCHER_PORT = 50102
+GATEWAY_PORT = 50200
 
 
 def start_llm(args):
@@ -119,6 +119,21 @@ def start_batcher(args):
     uvicorn.run(app, host=args.host, port=args.batcher_port)
 
 
+def start_gateway(args):
+    """Start the gateway service."""
+    from serve.server.gateway import GatewayServer, create_app as create_gateway_app
+    import uvicorn
+
+    gateway = GatewayServer(
+        llm_batcher_url=f'http://{args.host}:{args.llm_batcher_port}',
+        fm_batcher_url=f'http://{args.host}:{args.fm_batcher_port}',
+        vocoder_batcher_url=f'http://{args.host}:{args.vocoder_batcher_port}',
+        request_timeout=args.request_timeout,
+    )
+    app = create_gateway_app(gateway)
+    uvicorn.run(app, host=args.host, port=args.gateway_port)
+
+
 def _wait_for_port(host: str, port: int, timeout: float = 30.0):
     """Block until a TCP port is accepting connections."""
     import socket
@@ -133,7 +148,7 @@ def _wait_for_port(host: str, port: int, timeout: float = 30.0):
 
 
 def start_all(args):
-    """Start all backend services + dynamic batchers as subprocesses."""
+    """Start the full stack: backends → batchers → gateway."""
     import subprocess
 
     base_cmd = [sys.executable, '-u', os.path.abspath(__file__)]
@@ -148,7 +163,7 @@ def start_all(args):
         p = subprocess.Popen(cmd, env=os.environ.copy())
         procs.append((service, p))
 
-    # --- Phase 1: Launch backend services ---
+    # ── Phase 1: Backend services ──
     launch('llm', '--llm-port', args.llm_port)
     launch('fm', '--fm-port', args.fm_port)
     launch('vocoder', '--vocoder-port', args.vocoder_port)
@@ -159,7 +174,7 @@ def start_all(args):
         status = 'READY' if ok else 'TIMEOUT'
         print(f'  {name} (port {port}): {status}')
 
-    # --- Phase 2: Launch dynamic batchers ---
+    # ── Phase 2: Dynamic batchers ──
     batcher_script = os.path.join(_REPO_ROOT, 'serve', 'tool_func', 'dynamic_batch.py')
 
     batcher_configs = [
@@ -183,15 +198,47 @@ def start_all(args):
         p = subprocess.Popen(cmd, env=os.environ.copy())
         procs.append((name, p))
 
-    print(f'\nAll services started:')
+    print('Waiting for batchers to be ready ...')
+    for name, port in [('LLM-batcher', args.llm_batcher_port),
+                        ('FM-batcher', args.fm_batcher_port),
+                        ('Vocoder-batcher', args.vocoder_batcher_port)]:
+        ok = _wait_for_port(args.host, port, timeout=30.0)
+        status = 'READY' if ok else 'TIMEOUT'
+        print(f'  {name} (port {port}): {status}')
+
+    # ── Phase 3: Gateway ──
+    gateway_script = os.path.join(_REPO_ROOT, 'serve', 'server', 'gateway.py')
+    cmd = [
+        sys.executable, '-u', gateway_script,
+        '--llm-batcher-url', f'http://{args.host}:{args.llm_batcher_port}',
+        '--fm-batcher-url', f'http://{args.host}:{args.fm_batcher_port}',
+        '--vocoder-batcher-url', f'http://{args.host}:{args.vocoder_batcher_port}',
+        '--host', args.host,
+        '--port', str(args.gateway_port),
+    ]
+    print(f'Starting gateway on port {args.gateway_port} ...')
+    p = subprocess.Popen(cmd, env=os.environ.copy())
+    procs.append(('gateway', p))
+
+    ok = _wait_for_port(args.host, args.gateway_port, timeout=15.0)
+    gw_status = 'READY' if ok else 'TIMEOUT'
+
+    # ── Summary ──
+    print(f'\n{"=" * 60}')
+    print(f'  CosyVoice Inference Stack')
+    print(f'{"=" * 60}')
     print(f'  LLM backend:     http://{args.host}:{args.llm_port}')
     print(f'  FM backend:      http://{args.host}:{args.fm_port}')
     print(f'  Vocoder backend: http://{args.host}:{args.vocoder_port}')
-    print(f'  LLM batcher:     http://{args.host}:{args.llm_batcher_port}  (shared_keys: none)')
-    print(f'  FM batcher:      http://{args.host}:{args.fm_batcher_port}  (shared_keys: streaming,finalize)')
-    print(f'  Vocoder batcher: http://{args.host}:{args.vocoder_batcher_port}  (shared_keys: finalize)')
-    print('\n  ↳ Clients should send requests to the BATCHER ports for dynamic batching.')
-    print('Press Ctrl+C to stop all services.')
+    print(f'  ─────────────────────────────────────────')
+    print(f'  LLM batcher:     http://{args.host}:{args.llm_batcher_port}')
+    print(f'  FM batcher:      http://{args.host}:{args.fm_batcher_port}')
+    print(f'  Vocoder batcher: http://{args.host}:{args.vocoder_batcher_port}')
+    print(f'  ─────────────────────────────────────────')
+    print(f'  ★ Gateway:       http://{args.host}:{args.gateway_port}  [{gw_status}]')
+    print(f'{"=" * 60}')
+    print(f'\n  Game server → POST /v1/synthesize on Gateway port {args.gateway_port}')
+    print(f'  Press Ctrl+C to stop all services.\n')
 
     try:
         for _, p in procs:
@@ -208,7 +255,7 @@ def start_all(args):
 def main():
     parser = argparse.ArgumentParser(description='CosyVoice Service Launcher')
     parser.add_argument('--service', type=str,
-                        choices=['llm', 'fm', 'vocoder', 'batcher', 'all'],
+                        choices=['llm', 'fm', 'vocoder', 'batcher', 'gateway', 'all'],
                         default='all', help='Which service to start (default: all)')
     parser.add_argument('--host', type=str, default='0.0.0.0')
 
@@ -239,6 +286,9 @@ def main():
     parser.add_argument('--llm-batcher-port', type=int, default=LLM_BATCHER_PORT)
     parser.add_argument('--fm-batcher-port', type=int, default=FM_BATCHER_PORT)
     parser.add_argument('--vocoder-batcher-port', type=int, default=VOCODER_BATCHER_PORT)
+
+    # Gateway port configuration
+    parser.add_argument('--gateway-port', type=int, default=GATEWAY_PORT)
 
     # Shared inference params
     parser.add_argument('--max-batch-size', type=int, default=16)
@@ -286,6 +336,8 @@ def main():
         start_vocoder(args)
     elif args.service == 'batcher':
         start_batcher(args)
+    elif args.service == 'gateway':
+        start_gateway(args)
 
 
 if __name__ == '__main__':
