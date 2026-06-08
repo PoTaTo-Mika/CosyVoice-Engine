@@ -1,13 +1,16 @@
 """
 CosyVoice Service Launcher.
 
-Starts one or all of the three inference services:
-  - llm:   TensorRT-LLM based LLM server (text -> speech tokens)
-  - fm:    Flow Matching server (speech tokens -> mel spectrogram)
-  - vocoder: Vocoder server (mel spectrogram -> waveform)
+Starts inference services and their dynamic batchers:
+  - llm:          TensorRT-LLM based LLM server (text -> speech tokens)
+  - fm:           Flow Matching server (speech tokens -> mel spectrogram)
+  - vocoder:      Vocoder server (mel spectrogram -> waveform)
+  - llm-batcher:  Dynamic batcher in front of LLM
+  - fm-batcher:   Dynamic batcher in front of FM
+  - vocoder-batcher: Dynamic batcher in front of Vocoder
 
 Usage:
-    # Start all services:
+    # Start all services (backends + batchers):
     python serve/setup_server.py
 
     # Start a specific service:
@@ -19,6 +22,7 @@ Usage:
 import argparse
 import os
 import sys
+import time
 
 from serve.paths import CHECKPOINTS_DIR
 
@@ -30,6 +34,14 @@ _MATCHA_DIR = os.path.join(_COSYVOICE_DIR, 'third_party', 'Matcha-TTS')
 for p in [_REPO_ROOT, _COSYVOICE_DIR, _MATCHA_DIR]:
     if p not in sys.path:
         sys.path.insert(0, p)
+
+# Default ports
+LLM_BACKEND_PORT = 50000
+FM_BACKEND_PORT = 50001
+VOCODER_BACKEND_PORT = 50002
+LLM_BATCHER_PORT = 50100
+FM_BATCHER_PORT = 50101
+VOCODER_BATCHER_PORT = 50102
 
 
 def start_llm(args):
@@ -87,8 +99,41 @@ def start_vocoder(args):
     uvicorn.run(app, host=args.host, port=args.vocoder_port)
 
 
+def start_batcher(args):
+    """Start a single dynamic batcher as a standalone service."""
+    from serve.tool_func.dynamic_batch import DynamicBatcher, create_app as create_batcher_app
+    import uvicorn
+
+    shared_keys = [k.strip() for k in args.shared_keys.split(',') if k.strip()] if args.shared_keys else []
+
+    batcher = DynamicBatcher(
+        backend_url=args.batcher_backend_url,
+        max_batch_size=args.max_batch_size,
+        scan_interval=args.scan_interval,
+        max_wait_time=args.max_wait_time,
+        request_timeout=args.request_timeout,
+        shared_keys=shared_keys,
+        service_name=args.batcher_service,
+    )
+    app = create_batcher_app(batcher)
+    uvicorn.run(app, host=args.host, port=args.batcher_port)
+
+
+def _wait_for_port(host: str, port: int, timeout: float = 30.0):
+    """Block until a TCP port is accepting connections."""
+    import socket
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=1.0):
+                return True
+        except (ConnectionRefusedError, OSError):
+            time.sleep(0.3)
+    return False
+
+
 def start_all(args):
-    """Start all three services as subprocesses."""
+    """Start all backend services + dynamic batchers as subprocesses."""
     import subprocess
 
     base_cmd = [sys.executable, '-u', os.path.abspath(__file__)]
@@ -103,15 +148,50 @@ def start_all(args):
         p = subprocess.Popen(cmd, env=os.environ.copy())
         procs.append((service, p))
 
+    # --- Phase 1: Launch backend services ---
     launch('llm', '--llm-port', args.llm_port)
     launch('fm', '--fm-port', args.fm_port)
     launch('vocoder', '--vocoder-port', args.vocoder_port)
 
+    print('Waiting for backend services to be ready ...')
+    for name, port in [('LLM', args.llm_port), ('FM', args.fm_port), ('Vocoder', args.vocoder_port)]:
+        ok = _wait_for_port(args.host, port, timeout=60.0)
+        status = 'READY' if ok else 'TIMEOUT'
+        print(f'  {name} (port {port}): {status}')
+
+    # --- Phase 2: Launch dynamic batchers ---
+    batcher_script = os.path.join(_REPO_ROOT, 'serve', 'tool_func', 'dynamic_batch.py')
+
+    batcher_configs = [
+        ('llm-batcher', args.llm_batcher_port, args.llm_port, '', 'llm'),
+        ('fm-batcher', args.fm_batcher_port, args.fm_port, 'streaming,finalize', 'fm'),
+        ('vocoder-batcher', args.vocoder_batcher_port, args.vocoder_port, 'finalize', 'vocoder'),
+    ]
+
+    for name, batcher_port, backend_port, shared_keys, service in batcher_configs:
+        cmd = [
+            sys.executable, '-u', batcher_script,
+            '--backend-url', f'http://{args.host}:{backend_port}',
+            '--port', str(batcher_port),
+            '--host', args.host,
+            '--max-batch-size', str(args.max_batch_size),
+            '--service', service,
+        ]
+        if shared_keys:
+            cmd += ['--shared-keys', shared_keys]
+        print(f'Starting {name} on port {batcher_port} -> backend :{backend_port} ...')
+        p = subprocess.Popen(cmd, env=os.environ.copy())
+        procs.append((name, p))
+
     print(f'\nAll services started:')
-    print(f'  LLM:     http://{args.host}:{args.llm_port}')
-    print(f'  FM:      http://{args.host}:{args.fm_port}')
-    print(f'  Vocoder: http://{args.host}:{args.vocoder_port}')
-    print('\nPress Ctrl+C to stop all services.')
+    print(f'  LLM backend:     http://{args.host}:{args.llm_port}')
+    print(f'  FM backend:      http://{args.host}:{args.fm_port}')
+    print(f'  Vocoder backend: http://{args.host}:{args.vocoder_port}')
+    print(f'  LLM batcher:     http://{args.host}:{args.llm_batcher_port}  (shared_keys: none)')
+    print(f'  FM batcher:      http://{args.host}:{args.fm_batcher_port}  (shared_keys: streaming,finalize)')
+    print(f'  Vocoder batcher: http://{args.host}:{args.vocoder_batcher_port}  (shared_keys: finalize)')
+    print('\n  ↳ Clients should send requests to the BATCHER ports for dynamic batching.')
+    print('Press Ctrl+C to stop all services.')
 
     try:
         for _, p in procs:
@@ -127,7 +207,8 @@ def start_all(args):
 
 def main():
     parser = argparse.ArgumentParser(description='CosyVoice Service Launcher')
-    parser.add_argument('--service', type=str, choices=['llm', 'fm', 'vocoder', 'all'],
+    parser.add_argument('--service', type=str,
+                        choices=['llm', 'fm', 'vocoder', 'batcher', 'all'],
                         default='all', help='Which service to start (default: all)')
     parser.add_argument('--host', type=str, default='0.0.0.0')
 
@@ -149,13 +230,20 @@ def main():
                         default=os.path.join(CHECKPOINTS_DIR, 'trt_engines', 'hf_merged_bfloat16'),
                         help='Path to merged HuggingFace tokenizer')
 
-    # Port configuration
-    parser.add_argument('--llm-port', type=int, default=50000)
-    parser.add_argument('--fm-port', type=int, default=50001)
-    parser.add_argument('--vocoder-port', type=int, default=50002)
+    # Backend port configuration
+    parser.add_argument('--llm-port', type=int, default=LLM_BACKEND_PORT)
+    parser.add_argument('--fm-port', type=int, default=FM_BACKEND_PORT)
+    parser.add_argument('--vocoder-port', type=int, default=VOCODER_BACKEND_PORT)
+
+    # Batcher port configuration
+    parser.add_argument('--llm-batcher-port', type=int, default=LLM_BATCHER_PORT)
+    parser.add_argument('--fm-batcher-port', type=int, default=FM_BATCHER_PORT)
+    parser.add_argument('--vocoder-batcher-port', type=int, default=VOCODER_BATCHER_PORT)
+
+    # Shared inference params
+    parser.add_argument('--max-batch-size', type=int, default=16)
 
     # LLM server params
-    parser.add_argument('--max-batch-size', type=int, default=16)
     parser.add_argument('--max-output-len', type=int, default=2048)
     parser.add_argument('--max-input-len', type=int, default=512)
     parser.add_argument('--kv-cache-free-gpu-mem-fraction', type=float, default=0.5)
@@ -170,6 +258,22 @@ def main():
     parser.add_argument('--inference-cfg-rate', type=float, default=None,
                         help='Override CFG rate for flow matching')
 
+    # Batcher params (used with --service batcher)
+    parser.add_argument('--batcher-backend-url', type=str, default='http://localhost:50000',
+                        help='Backend URL for standalone batcher')
+    parser.add_argument('--batcher-port', type=int, default=50100,
+                        help='Listen port for standalone batcher')
+    parser.add_argument('--batcher-service', type=str, default='unknown',
+                        help='Service name label for standalone batcher')
+    parser.add_argument('--shared-keys', type=str, default='',
+                        help='Comma-separated shared keys for standalone batcher')
+    parser.add_argument('--scan-interval', type=float, default=0.2,
+                        help='Queue scan interval in seconds')
+    parser.add_argument('--max-wait-time', type=float, default=0.6,
+                        help='Max time a request waits before partial batch dispatch')
+    parser.add_argument('--request-timeout', type=float, default=60.0,
+                        help='Timeout for individual request (seconds)')
+
     args = parser.parse_args()
 
     if args.service == 'all':
@@ -180,6 +284,8 @@ def main():
         start_fm(args)
     elif args.service == 'vocoder':
         start_vocoder(args)
+    elif args.service == 'batcher':
+        start_batcher(args)
 
 
 if __name__ == '__main__':

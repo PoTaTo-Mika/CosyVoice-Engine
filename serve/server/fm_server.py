@@ -119,30 +119,26 @@ def create_app(server: CosyVoiceFMServer):
     app = FastAPI(title='CosyVoice Flow Matching Server')
     app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
 
-    infer_lock = asyncio.Lock()
-
     @app.post('/v1/generate')
     async def generate(request: dict):
-        async with infer_lock:
-            return await asyncio.to_thread(
-                server.generate,
-                token=request['token'],
-                prompt_token=request['prompt_token'],
-                prompt_feat=request['prompt_feat'],
-                embedding=request['embedding'],
-                streaming=request.get('streaming', False),
-                finalize=request.get('finalize', True),
-            )
+        return await asyncio.to_thread(
+            server.generate,
+            token=request['token'],
+            prompt_token=request['prompt_token'],
+            prompt_feat=request['prompt_feat'],
+            embedding=request['embedding'],
+            streaming=request.get('streaming', False),
+            finalize=request.get('finalize', True),
+        )
 
     @app.post('/v1/generate_batch')
     async def generate_batch(request: dict):
-        async with infer_lock:
-            return await asyncio.to_thread(
-                server.generate_batch,
-                items=request['items'],
-                streaming=request.get('streaming', False),
-                finalize=request.get('finalize', True),
-            )
+        return await asyncio.to_thread(
+            server.generate_batch,
+            items=request['items'],
+            streaming=request.get('streaming', False),
+            finalize=request.get('finalize', True),
+        )
 
     @app.get('/health')
     async def health():
